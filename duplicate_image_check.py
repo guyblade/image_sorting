@@ -1,35 +1,52 @@
 #!/usr/bin/env python
 
+import threading
 import os
 import re
 import hashlib
 import sys
 import collections
 import multiprocessing
+import time
 
 IMAGE_SUFFIXES = ["\\.gif", "\\.jpg", "\\.jpeg", "\\.png", "\\.bmp"]
 
+USE_PARALLEL_HASHING = True
+
 class HashedImages(object):
   def __init__(self, max_threads=None):
-    self._max_threads_ = max_threads
+    self._max_threads = max_threads
     self._pool = multiprocessing.Pool(self._max_threads)
     self._lock = threading.Lock()
     self._images = collections.defaultdict(list)
+    self._first_image_added = None
 
-  def AddImage(filename):
-    def AddAsync():
-      hash, filename = hash_and_name(filename)
-      with self._lock:
-        self._images[hash].append(filename)
-    self._pool.apply_async(AddAsync)
+  def _AddImageCallback(self, result):
+    hash, filename = result
+    with self._lock:
+      self._images[hash].append(filename)
 
-  def GetImages():
+  def AddImage(self, filename):
+    if self._first_image_added is None:
+      self._first_image_added = time.time()
+    if not USE_PARALLEL_HASHING:
+      self._AddImageCallback(hash_and_name(filename))
+    else:
+      self._pool.apply_async(hash_and_name, args=(filename,),
+                             callback=self._AddImageCallback)
+
+  def GetImages(self):
+    print "Waiting on hashing to complete."
     self._pool.close()
     self._pool.join()
+    print "Hashing complete."
+    print "Time to find files and hash them: %s" % (
+        time.time() - self._first_image_added)
     return self._images
 
-def has_image_filename(filename, allowed_suffixes):
-  for suffix in allowed_suffixes:
+
+def has_image_filename(filename):
+  for suffix in IMAGE_SUFFIXES:
     expr = ".*" + suffix + '$'
     if re.match(expr, filename, re.IGNORECASE):
       return True
@@ -40,29 +57,24 @@ def hash_and_name(filename):
   m.update(open(filename).read())
   return [m.hexdigest(), filename]
 
-def add_files(directory, allowed_suffixes):
+def add_files(directory, hashes):
   files = os.listdir(directory)
   directories_to_process = []
-  images_with_hashes = []
   for filename in files:
     if filename == "." or filename == "..":
       continue
     fname = directory + "/" + filename
     if os.path.isdir(fname):
       directories_to_process.append(fname)
-    if has_image_filename(fname, allowed_suffixes):
-      images_with_hashes.append(hash_and_name(fname))
+    if has_image_filename(fname):
+      hashes.AddImage(fname)
 
   for directory in directories_to_process:
-    images_with_hashes.extend(add_files(directory, allowed_suffixes))
-  return images_with_hashes
+    add_files(directory, hashes)
 
 def find_dupes(hash_and_file_list):
-  all = collections.defaultdict(list)
-  for hash, filename in hash_and_file_list:
-    all[hash].append(filename)
   only_dupes = {}
-  for hash, lst in all.iteritems():
+  for hash, lst in hash_and_file_list.iteritems():
     if len(lst) > 1:
       only_dupes[hash] = lst
   return only_dupes
@@ -102,10 +114,10 @@ def main(argv=None):
   dir_names = ['.']
   if len(argv) >= 2:
     dir_names = argv[1:]
-  files = []
+  hashes = HashedImages()
   for dir in dir_names:
-    files.extend(add_files(dir, IMAGE_SUFFIXES))
-  dupes = find_dupes(files)
+    add_files(dir, hashes)
+  dupes = find_dupes(hashes.GetImages())
   handle_dupe_list(dupes)
 
 if __name__ == "__main__":
